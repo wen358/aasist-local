@@ -16,10 +16,11 @@ The repository includes pretrained AASIST weights under `models/weights/`.
 
 Two local files were added:
 
-- `config/AASIST_local_2019.conf`: points `database_path` to the local ASVspoof 2019 LA folder.
 - `eval_manifest.py`: evaluates pretrained AASIST on the CSV manifests used by the CDBD project.
+- `local_configs/AASIST_manifest_eval.conf`: tracked config for manifest-based evaluation on local, Kaggle, or Colab.
 
 `eval_manifest.py` avoids extra dependencies such as `soundfile` by decoding non-WAV files through `ffmpeg` and reading WAV data with the Python standard library.
+For manifest-based evaluation, `database_path` is not used because each audio path comes from the CSV manifest.
 
 ## Smoke Test
 
@@ -28,7 +29,7 @@ From this directory:
 ```powershell
 & "D:\audio deepfake detecation\.venv\Scripts\python.exe" eval_manifest.py `
   --manifest "D:\audio deepfake detecation\github_upload\cdbd-audio\manifests\cross_2021_df_direct_2.csv" `
-  --config config\AASIST_local_2019.conf `
+  --config local_configs\AASIST_manifest_eval.conf `
   --weights models\weights\AASIST.pth `
   --device cpu `
   --batch-size 1
@@ -41,7 +42,7 @@ ASVspoof 2021 DF direct 500-per-class subset:
 ```powershell
 & "D:\audio deepfake detecation\.venv\Scripts\python.exe" eval_manifest.py `
   --manifest "D:\audio deepfake detecation\github_upload\cdbd-audio\manifests\cross_2021_df_direct_500.csv" `
-  --config config\AASIST_local_2019.conf `
+  --config local_configs\AASIST_manifest_eval.conf `
   --weights models\weights\AASIST.pth `
   --output-scores "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\aasist_2021_df_direct_500_scores.csv" `
   --device cpu `
@@ -53,7 +54,7 @@ ASVspoof 2019 LA compressed dev subset:
 ```powershell
 & "D:\audio deepfake detecation\.venv\Scripts\python.exe" eval_manifest.py `
   --manifest "D:\audio deepfake detecation\github_upload\cdbd-audio\manifests\local_500_per_class_dev_compressed.csv" `
-  --config config\AASIST_local_2019.conf `
+  --config local_configs\AASIST_manifest_eval.conf `
   --weights models\weights\AASIST.pth `
   --output-scores "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\aasist_2019_dev_compressed_scores.csv" `
   --device cpu `
