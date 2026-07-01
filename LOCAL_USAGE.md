@@ -19,6 +19,7 @@ Two local files were added:
 - `eval_manifest.py`: evaluates pretrained AASIST on the CSV manifests used by the CDBD project.
 - `local_configs/AASIST_manifest_eval.conf`: tracked config for manifest-based evaluation on local, Kaggle, or Colab.
 - `summarize_scores_by_codec.py`: summarizes an existing `eval_manifest.py --output-scores` CSV by codec without rerunning AASIST inference.
+- `codec_calibration_experiment.py`: runs held-out codec-aware score-shift calibration on an existing score CSV.
 
 `eval_manifest.py` avoids extra dependencies such as `soundfile` by decoding non-WAV files through `ffmpeg` and reading WAV data with the Python standard library.
 For manifest-based evaluation, `database_path` is not used because each audio path comes from the CSV manifest.
@@ -73,6 +74,22 @@ If `eval_manifest.py` was already run with `--output-scores`, compute codec-leve
   --scores "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\aasist_2021_df_direct_500_scores.csv" `
   --output "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\aasist_2021_df_direct_500_by_codec.csv"
 ```
+
+## Codec-Aware Calibration Experiment
+
+Use a stratified calibration split from an existing score CSV, learn score shifts for selected codecs, and evaluate on the held-out split:
+
+```powershell
+& "D:\audio deepfake detecation\.venv\Scripts\python.exe" codec_calibration_experiment.py `
+  --scores "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\aasist_2021_df_direct_500_scores.csv" `
+  --output-json "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\codec_calibration_2021_df_500_each_target_codecs.json" `
+  --output-shifted-scores "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\codec_calibration_2021_df_500_each_shifted_scores.csv" `
+  --target-codecs high_ogg high_mp3 low_m4a `
+  --cal-per-class 20 `
+  --seed 0
+```
+
+This is an analysis tool, not a training script. Report both the `before` and `after` held-out metrics; do not treat calibration as useful unless held-out EER improves.
 
 ## Next Step
 
