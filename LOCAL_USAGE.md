@@ -18,6 +18,7 @@ Two local files were added:
 
 - `eval_manifest.py`: evaluates pretrained AASIST on the CSV manifests used by the CDBD project.
 - `local_configs/AASIST_manifest_eval.conf`: tracked config for manifest-based evaluation on local, Kaggle, or Colab.
+- `summarize_scores_by_codec.py`: summarizes an existing `eval_manifest.py --output-scores` CSV by codec without rerunning AASIST inference.
 
 `eval_manifest.py` avoids extra dependencies such as `soundfile` by decoding non-WAV files through `ffmpeg` and reading WAV data with the Python standard library.
 For manifest-based evaluation, `database_path` is not used because each audio path comes from the CSV manifest.
@@ -62,6 +63,16 @@ ASVspoof 2019 LA compressed dev subset:
 ```
 
 CPU evaluation is expected to be slow. Use Kaggle or Colab GPU for full-scale runs.
+
+## Summarize Existing Scores By Codec
+
+If `eval_manifest.py` was already run with `--output-scores`, compute codec-level metrics without rerunning the model:
+
+```powershell
+& "D:\audio deepfake detecation\.venv\Scripts\python.exe" summarize_scores_by_codec.py `
+  --scores "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\aasist_2021_df_direct_500_scores.csv" `
+  --output "D:\audio deepfake detecation\github_upload\cdbd-audio\outputs\metrics\aasist_2021_df_direct_500_by_codec.csv"
+```
 
 ## Next Step
 
