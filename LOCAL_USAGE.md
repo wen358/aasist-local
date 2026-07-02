@@ -20,6 +20,9 @@ Two local files were added:
 - `local_configs/AASIST_manifest_eval.conf`: tracked config for manifest-based evaluation on local, Kaggle, or Colab.
 - `summarize_scores_by_codec.py`: summarizes an existing `eval_manifest.py --output-scores` CSV by codec without rerunning AASIST inference.
 - `codec_calibration_experiment.py`: runs held-out codec-aware score-shift calibration on an existing score CSV.
+- `prepare_kaggle_manifests.py`: creates committed Kaggle-path 2021 DF manifests from a local full manifest.
+- `manifests/kaggle_2021_df_direct_50_each.csv`: 100-sample Kaggle smoke-test manifest.
+- `manifests/kaggle_2021_df_codec_balanced_full.csv`: codec-balanced 2021 DF manifest with 45,234 samples.
 
 `eval_manifest.py` avoids extra dependencies such as `soundfile` by decoding non-WAV files through `ffmpeg` and reading WAV data with the Python standard library.
 For manifest-based evaluation, `database_path` is not used because each audio path comes from the CSV manifest.
@@ -90,6 +93,46 @@ Use a stratified calibration split from an existing score CSV, learn score shift
 ```
 
 This is an analysis tool, not a training script. Report both the `before` and `after` held-out metrics; do not treat calibration as useful unless held-out EER improves.
+
+## Kaggle Fast Start
+
+After cloning this repository in Kaggle, use the committed Kaggle-path manifests directly. This avoids rebuilding the 611,829-row 2021 DF manifest at every session start.
+
+Smoke test:
+
+```bash
+%cd /kaggle/working/aasist-local
+
+!python eval_manifest.py \
+  --manifest manifests/kaggle_2021_df_direct_50_each.csv \
+  --config local_configs/AASIST_manifest_eval.conf \
+  --weights models/weights/AASIST.pth \
+  --output-scores /kaggle/working/aasist_2021_df_direct_50_each_scores.csv \
+  --output-codec-metrics /kaggle/working/aasist_2021_df_direct_50_each_by_codec.csv \
+  --group-by-codec \
+  --progress-every 20 \
+  --device cuda \
+  --batch-size 32
+```
+
+Codec-balanced evaluation:
+
+```bash
+%cd /kaggle/working/aasist-local
+
+!python eval_manifest.py \
+  --manifest manifests/kaggle_2021_df_codec_balanced_full.csv \
+  --config local_configs/AASIST_manifest_eval.conf \
+  --weights models/weights/AASIST.pth \
+  --output-scores /kaggle/working/aasist_2021_df_codec_balanced_full_scores.csv \
+  --output-codec-metrics /kaggle/working/aasist_2021_df_codec_balanced_full_by_codec.csv \
+  --group-by-codec \
+  --progress-every 5000 \
+  --device cuda \
+  --batch-size 64
+```
+
+If CUDA memory is tight, set `--batch-size 32`. These manifests assume the Kaggle input path `/kaggle/input/datasets/pankajsomkuwar/asvspoof-2021-df`.
 
 ## Next Step
 
