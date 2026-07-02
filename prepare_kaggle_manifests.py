@@ -88,9 +88,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--smoke-per-class", type=int, default=50)
     parser.add_argument("--codec-per-class", type=int, default=2513)
+    parser.add_argument("--write-full", action="store_true")
     args = parser.parse_args()
 
     rows = convert_paths(read_manifest(args.source))
+    if args.write_full:
+        write_manifest(args.output_dir / "kaggle_2021_df_eval_full.csv", rows)
     write_manifest(
         args.output_dir / f"kaggle_2021_df_direct_{args.smoke_per_class}_each.csv",
         balanced_by_label(rows, per_class=args.smoke_per_class, seed=args.seed),
