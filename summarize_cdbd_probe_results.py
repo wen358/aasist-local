@@ -10,6 +10,18 @@ def metric(result: dict, section: str, name: str) -> float:
     return float(result[section]["overall"][name])
 
 
+def cdbd_section(result: dict) -> str:
+    classifier = result.get("classifier")
+    if classifier:
+        key = f"cdbd_probe_{classifier}"
+        if key in result:
+            return key
+    for key in ("cdbd_probe_mlp", "cdbd_probe_logreg"):
+        if key in result:
+            return key
+    raise KeyError("result does not contain a CDBD probe metric section")
+
+
 def mean(values: list[float]) -> float:
     return statistics.mean(values) if values else float("nan")
 
@@ -22,10 +34,11 @@ def summarize_group(group: str, paths: list[Path]) -> dict:
     rows = []
     for path in paths:
         result = json.loads(path.read_text(encoding="utf-8"))
+        section = cdbd_section(result)
         baseline_eer = metric(result, "baseline_original_score", "eer_percent")
-        cdbd_eer = metric(result, "cdbd_probe_logreg", "eer_percent")
+        cdbd_eer = metric(result, section, "eer_percent")
         baseline_acc = metric(result, "baseline_original_score", "accuracy_at_0")
-        cdbd_acc = metric(result, "cdbd_probe_logreg", "accuracy_at_0")
+        cdbd_acc = metric(result, section, "accuracy_at_0")
         rows.append(
             {
                 "path": str(path),

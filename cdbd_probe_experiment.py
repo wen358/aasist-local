@@ -5,6 +5,7 @@ import json
 import random
 import subprocess
 import tempfile
+import time
 import wave
 from collections import defaultdict
 from pathlib import Path
@@ -29,6 +30,33 @@ DEFAULT_PROBES = [
 ]
 
 
+def run_with_retry(command: list[str], attempts: int = 3) -> None:
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(command, check=True)
+            return
+        except subprocess.CalledProcessError as error:
+            last_error = error
+            if attempt == attempts:
+                break
+            time.sleep(0.5 * attempt)
+    raise last_error
+
+
+def load_audio_with_retry(path: Path, attempts: int = 3) -> tuple[np.ndarray, int]:
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return load_audio(path)
+        except subprocess.CalledProcessError as error:
+            last_error = error
+            if attempt == attempts:
+                break
+            time.sleep(0.5 * attempt)
+    raise last_error
+
+
 def write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
     clipped = np.clip(audio, -1.0, 1.0)
     pcm = (clipped * 32767.0).astype("<i2")
@@ -40,7 +68,7 @@ def write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
 
 
 def ffmpeg_decode(input_path: Path, output_path: Path, sample_rate: int) -> None:
-    subprocess.run(
+    run_with_retry(
         [
             "ffmpeg",
             "-y",
@@ -56,8 +84,7 @@ def ffmpeg_decode(input_path: Path, output_path: Path, sample_rate: int) -> None
             "-ar",
             str(sample_rate),
             str(output_path),
-        ],
-        check=True,
+        ]
     )
 
 
@@ -82,10 +109,10 @@ def codec_roundtrip(audio: np.ndarray, sample_rate: int, probe: str, temp_dir: P
     else:
         raise ValueError(f"unsupported codec probe: {probe}")
 
-    subprocess.run(command, check=True)
+    run_with_retry(command)
     decoded = temp_dir / "decoded.wav"
     ffmpeg_decode(encoded, decoded, sample_rate)
-    decoded_audio, _ = load_audio(decoded)
+    decoded_audio, _ = load_audio_with_retry(decoded)
     return decoded_audio
 
 
@@ -95,22 +122,22 @@ def ffmpeg_filter(audio: np.ndarray, sample_rate: int, probe: str, temp_dir: Pat
     output = temp_dir / "filtered.wav"
     if probe == "resample_8k":
         command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-ar", "8000", "-ac", "1", str(output)]
-        subprocess.run(command, check=True)
+        run_with_retry(command)
         back = temp_dir / "filtered_back.wav"
         ffmpeg_decode(output, back, sample_rate)
-        decoded_audio, _ = load_audio(back)
+        decoded_audio, _ = load_audio_with_retry(back)
         return decoded_audio
     if probe == "resample_22050":
         command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-ar", "22050", "-ac", "1", str(output)]
-        subprocess.run(command, check=True)
+        run_with_retry(command)
         back = temp_dir / "filtered_back.wav"
         ffmpeg_decode(output, back, sample_rate)
-        decoded_audio, _ = load_audio(back)
+        decoded_audio, _ = load_audio_with_retry(back)
         return decoded_audio
     if probe == "atempo_0.95":
         command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-filter:a", "atempo=0.95", "-ac", "1", str(output)]
-        subprocess.run(command, check=True)
-        decoded_audio, _ = load_audio(output)
+        run_with_retry(command)
+        decoded_audio, _ = load_audio_with_retry(output)
         return decoded_audio
     raise ValueError(f"unsupported filter probe: {probe}")
 
@@ -317,6 +344,70 @@ def predict_logistic(features: np.ndarray, weights: np.ndarray, mean: np.ndarray
     return x @ weights
 
 
+class MLPBackend(torch.nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features).squeeze(1)
+
+
+def fit_predict_mlp(
+    train_features: np.ndarray,
+    train_labels: np.ndarray,
+    all_features: np.ndarray,
+    seed: int,
+    hidden_dim: int,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    dropout: float,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    targets = (train_labels == 0).astype(np.float32)
+    mean = train_features.mean(axis=0)
+    std = train_features.std(axis=0) + 1e-6
+    train_x = ((train_features - mean) / std).astype(np.float32)
+    all_x = ((all_features - mean) / std).astype(np.float32)
+
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    model = MLPBackend(train_x.shape[1], hidden_dim, dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    dataset = torch.utils.data.TensorDataset(torch.from_numpy(train_x), torch.from_numpy(targets))
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+
+    model.train()
+    for _ in range(epochs):
+        for batch_x, batch_y in loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(batch_x), batch_y)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    scores = []
+    with torch.no_grad():
+        for start in range(0, all_x.shape[0], batch_size):
+            batch_x = torch.from_numpy(all_x[start : start + batch_size]).to(device)
+            scores.append(model(batch_x).detach().cpu().numpy())
+    return np.concatenate(scores, axis=0).astype(np.float64)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="CDBD-style multi-probe response experiment on top of frozen AASIST.")
     parser.add_argument("--manifest", type=Path, required=True)
@@ -336,6 +427,13 @@ def main() -> None:
     parser.add_argument("--logreg-steps", type=int, default=2000)
     parser.add_argument("--logreg-lr", type=float, default=0.05)
     parser.add_argument("--logreg-l2", type=float, default=1e-3)
+    parser.add_argument("--classifier", choices=["logreg", "mlp"], default="logreg")
+    parser.add_argument("--mlp-hidden", type=int, default=128)
+    parser.add_argument("--mlp-epochs", type=int, default=100)
+    parser.add_argument("--mlp-lr", type=float, default=1e-3)
+    parser.add_argument("--mlp-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--mlp-dropout", type=float, default=0.2)
+    parser.add_argument("--mlp-batch-size", type=int, default=256)
     args = parser.parse_args()
 
     if "original" not in args.probes:
@@ -354,7 +452,7 @@ def main() -> None:
     utterance_ids = []
 
     for index, row in enumerate(rows, start=1):
-        audio, sample_rate = load_audio(row["path"])
+        audio, sample_rate = load_audio_with_retry(row["path"])
         views = [apply_probe(audio, sample_rate, probe, row["utterance_id"]) for probe in args.probes]
         scores, embeddings = encode_views(model, device, cut, views, args.batch_size)
         score_map = dict(zip(args.probes, scores))
@@ -381,14 +479,29 @@ def main() -> None:
     original_scores = feature_array[:, names.index("score_original")]
     cal_indexes, test_indexes = split_calibration(rows, args.cal_per_codec_class, args.seed)
 
-    weights, mean, std = fit_logistic_regression(
-        feature_array[cal_indexes],
-        label_array[cal_indexes],
-        steps=args.logreg_steps,
-        lr=args.logreg_lr,
-        l2=args.logreg_l2,
-    )
-    cdbd_scores = predict_logistic(feature_array, weights, mean, std)
+    if args.classifier == "logreg":
+        weights, mean, std = fit_logistic_regression(
+            feature_array[cal_indexes],
+            label_array[cal_indexes],
+            steps=args.logreg_steps,
+            lr=args.logreg_lr,
+            l2=args.logreg_l2,
+        )
+        cdbd_scores = predict_logistic(feature_array, weights, mean, std)
+    else:
+        cdbd_scores = fit_predict_mlp(
+            feature_array[cal_indexes],
+            label_array[cal_indexes],
+            feature_array,
+            seed=args.seed,
+            hidden_dim=args.mlp_hidden,
+            epochs=args.mlp_epochs,
+            lr=args.mlp_lr,
+            weight_decay=args.mlp_weight_decay,
+            dropout=args.mlp_dropout,
+            batch_size=args.mlp_batch_size,
+            device=device,
+        )
 
     test_labels = label_array[test_indexes]
     test_original = original_scores[test_indexes]
@@ -402,12 +515,13 @@ def main() -> None:
         "seed": args.seed,
         "probes": args.probes,
         "feature_level": args.feature_level,
+        "classifier": args.classifier,
         "feature_names": names,
         "baseline_original_score": {
             "overall": metrics(test_labels, test_original),
             "by_codec": metrics_by_codec(test_labels, test_original, test_codecs),
         },
-        "cdbd_probe_logreg": {
+        f"cdbd_probe_{args.classifier}": {
             "overall": metrics(test_labels, test_cdbd),
             "by_codec": metrics_by_codec(test_labels, test_cdbd, test_codecs),
         },
