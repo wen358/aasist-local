@@ -306,6 +306,14 @@ def feature_names(probes: list[str], embedding_dim: int, feature_level: str) -> 
     raise ValueError(f"unsupported feature level: {feature_level}")
 
 
+def codec_onehot(codec: str, codec_names: list[str]) -> list[float]:
+    return [1.0 if codec == name else 0.0 for name in codec_names]
+
+
+def codec_feature_names(codec_names: list[str]) -> list[str]:
+    return [f"codec_{name}" for name in codec_names]
+
+
 def split_calibration(rows: list[dict], cal_per_codec_class: int, seed: int) -> tuple[list[int], list[int]]:
     grouped: dict[tuple[str, int], list[int]] = defaultdict(list)
     for index, row in enumerate(rows):
@@ -434,6 +442,7 @@ def main() -> None:
     parser.add_argument("--mlp-weight-decay", type=float, default=1e-4)
     parser.add_argument("--mlp-dropout", type=float, default=0.2)
     parser.add_argument("--mlp-batch-size", type=int, default=256)
+    parser.add_argument("--use-codec-onehot", action="store_true")
     args = parser.parse_args()
 
     if "original" not in args.probes:
@@ -442,6 +451,7 @@ def main() -> None:
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     model, cut = load_model(args.config, args.weights, device)
     rows = sample_rows(read_manifest(args.manifest), args.max_per_codec_class, args.seed)
+    codec_names = sorted({row["codec"] for row in rows})
     names = None
 
     probe_score_rows = []
@@ -459,7 +469,11 @@ def main() -> None:
         embedding_map = dict(zip(args.probes, embeddings))
         if names is None:
             names = feature_names(args.probes, embeddings.shape[1], args.feature_level)
+            if args.use_codec_onehot:
+                names = [*names, *codec_feature_names(codec_names)]
         row_features = response_features(score_map, embedding_map, args.probes, args.feature_level)
+        if args.use_codec_onehot:
+            row_features = [*row_features, *codec_onehot(row["codec"], codec_names)]
 
         for probe in args.probes:
             probe_score_rows.append([row["utterance_id"], row["codec"], row["label"], probe, score_map[probe]])
@@ -516,6 +530,8 @@ def main() -> None:
         "probes": args.probes,
         "feature_level": args.feature_level,
         "classifier": args.classifier,
+        "use_codec_onehot": args.use_codec_onehot,
+        "codec_onehot_names": codec_names if args.use_codec_onehot else [],
         "feature_names": names,
         "baseline_original_score": {
             "overall": metrics(test_labels, test_original),
