@@ -13,7 +13,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from eval_manifest import load_audio, load_model, metrics, metrics_by_codec, pad, read_manifest
+from eval_manifest import load_audio, load_model as load_aasist_model, metrics, metrics_by_codec, pad
+from eval_ssl_manifest import TARGET_SAMPLES, load_model as load_ssl_model, pad_or_trim, read_manifest, score_logits
 
 
 DEFAULT_PROBES = [
@@ -202,17 +203,51 @@ def sample_rows(rows: list[dict], max_per_codec_class: int | None, seed: int) ->
     return sampled
 
 
-def encode_views(model, device: torch.device, cut: int, views: list[np.ndarray], batch_size: int) -> tuple[list[float], np.ndarray]:
+def encode_views(
+    model,
+    backbone: str,
+    device: torch.device,
+    cut: int,
+    views: list[np.ndarray],
+    batch_size: int,
+    ssl_score_mode: str,
+) -> tuple[list[float], np.ndarray]:
     scores = []
     embeddings = []
     with torch.no_grad():
         for start in range(0, len(views), batch_size):
-            batch = [pad(view, cut) for view in views[start : start + batch_size]]
+            if backbone == "aasist":
+                batch = [pad(view, cut) for view in views[start : start + batch_size]]
+            elif backbone == "ssl_wav2vec2":
+                batch = [pad_or_trim(view, cut) for view in views[start : start + batch_size]]
+            else:
+                raise ValueError(f"unsupported backbone: {backbone}")
             tensor = torch.tensor(np.stack(batch), dtype=torch.float32).to(device)
-            hidden, logits = model(tensor)
-            scores.extend(logits[:, 1].detach().cpu().numpy().astype(float).tolist())
-            embeddings.append(hidden.detach().cpu().numpy().astype(np.float64))
+            if backbone == "aasist":
+                hidden, logits = model(tensor)
+                batch_scores = logits[:, 1].detach().cpu().numpy().astype(float)
+                batch_embeddings = hidden.detach().cpu().numpy().astype(np.float64)
+            else:
+                outputs = model({"frames": tensor})
+                batch_scores = score_logits(outputs["logits"], ssl_score_mode).astype(float)
+                batch_embeddings = outputs["embedding"].detach().cpu().numpy().astype(np.float64)
+            scores.extend(batch_scores.tolist())
+            embeddings.append(batch_embeddings)
     return scores, np.concatenate(embeddings, axis=0)
+
+
+def load_backbone(args, device: torch.device):
+    if args.backbone == "aasist":
+        return load_aasist_model(args.config, args.weights, device)
+    if args.backbone == "ssl_wav2vec2":
+        model = load_ssl_model(
+            args.weights,
+            device=device,
+            hidden_dim=args.ssl_hidden_dim,
+            dropout=args.ssl_dropout,
+        )
+        return model, args.ssl_target_samples
+    raise ValueError(f"unsupported backbone: {args.backbone}")
 
 
 def score_response_features(score_map: dict[str, float], probes: list[str]) -> list[float]:
@@ -653,13 +688,19 @@ def fit_predict_probe_attention(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CDBD-style multi-probe response experiment on top of frozen AASIST.")
+    parser = argparse.ArgumentParser(description="CDBD-style multi-probe response experiment on top of frozen anti-spoofing backbones.")
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--backbone", choices=["aasist", "ssl_wav2vec2"], default="aasist")
     parser.add_argument("--config", type=Path, default=Path("local_configs/AASIST_manifest_eval.conf"))
     parser.add_argument("--weights", type=Path, default=Path("models/weights/AASIST.pth"))
+    parser.add_argument("--ssl-score-mode", choices=["bonafide_minus_spoof", "bonafide_logit", "negative_spoof_logit"], default="bonafide_minus_spoof")
+    parser.add_argument("--ssl-hidden-dim", type=int, default=256)
+    parser.add_argument("--ssl-dropout", type=float, default=0.1)
+    parser.add_argument("--ssl-target-samples", type=int, default=TARGET_SAMPLES)
     parser.add_argument("--output-probe-scores", type=Path, required=True)
     parser.add_argument("--output-features", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--output-predictions", type=Path)
     parser.add_argument("--probes", nargs="+", default=DEFAULT_PROBES)
     parser.add_argument("--probe-policy", choices=["fixed", "codec_adaptive"], default="fixed")
     parser.add_argument("--max-per-codec-class", type=int)
@@ -690,7 +731,7 @@ def main() -> None:
         raise ValueError("--probe-policy codec_adaptive currently supports logreg/mlp classifiers only")
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
-    model, cut = load_model(args.config, args.weights, device)
+    model, cut = load_backbone(args, device)
     rows = sample_rows(read_manifest(args.manifest), args.max_per_codec_class, args.seed)
     codec_names = sorted({row["codec"] for row in rows})
     names = None
@@ -711,7 +752,7 @@ def main() -> None:
         row_probes = probes_for_codec(row["codec"], args.probes, args.probe_policy)
         selected_probe_counts[" ".join(row_probes)] += 1
         views = [apply_probe(audio, sample_rate, probe, row["utterance_id"]) for probe in row_probes]
-        scores, embeddings = encode_views(model, device, cut, views, args.batch_size)
+        scores, embeddings = encode_views(model, args.backbone, device, cut, views, args.batch_size, args.ssl_score_mode)
         score_map = dict(zip(row_probes, scores))
         embedding_map = dict(zip(row_probes, embeddings))
         if names is None:
@@ -826,6 +867,9 @@ def main() -> None:
     test_fusion = fusion_scores[test_indexes]
     result = {
         "manifest": str(args.manifest),
+        "backbone": args.backbone,
+        "weights": str(args.weights),
+        "ssl_score_mode": args.ssl_score_mode if args.backbone == "ssl_wav2vec2" else None,
         "n_total": len(rows),
         "n_calibration": len(cal_indexes),
         "n_test": len(test_indexes),
@@ -871,6 +915,27 @@ def main() -> None:
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    if args.output_predictions:
+        split_names = ["calibration" if index in set(cal_indexes) else "test" for index in range(len(rows))]
+        args.output_predictions.parent.mkdir(parents=True, exist_ok=True)
+        with args.output_predictions.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["utterance_id", "codec", "label", "split", "original_score", "cdbd_score", "fusion_score"])
+            for index, split_name in enumerate(split_names):
+                writer.writerow(
+                    [
+                        utterance_ids[index],
+                        codecs[index],
+                        int(label_array[index]),
+                        split_name,
+                        float(original_scores[index]),
+                        float(cdbd_scores[index]),
+                        float(fusion_scores[index]),
+                    ]
+                )
+        print(f"wrote predictions: {args.output_predictions}")
+
     print(json.dumps(result, indent=2))
     print(f"wrote probe scores: {args.output_probe_scores}")
     print(f"wrote features: {args.output_features}")
