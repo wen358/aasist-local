@@ -29,6 +29,22 @@ DEFAULT_PROBES = [
     "gain_0.9",
 ]
 
+LIGHT_QUANTIZE_PROBES = ["original", "noise_20db", "gain_0.9", "mulaw", "alaw"]
+CODEC_TARGET_PROBES = ["original", "noise_20db", "gain_0.9", "mp3_64k", "aac_64k", "ogg_q4"]
+MIXED_TARGET_PROBES = ["original", "noise_20db", "gain_0.9", "mulaw", "alaw", "mp3_64k", "ogg_q4", "resample_8k"]
+CODEC_ADAPTIVE_PROBES = {
+    "oggm4a": CODEC_TARGET_PROBES,
+    "low_mp3": MIXED_TARGET_PROBES,
+}
+
+
+def probes_for_codec(codec: str, default_probes: list[str], probe_policy: str) -> list[str]:
+    if probe_policy == "fixed":
+        return default_probes
+    if probe_policy == "codec_adaptive":
+        return CODEC_ADAPTIVE_PROBES.get(codec, LIGHT_QUANTIZE_PROBES)
+    raise ValueError(f"unsupported probe policy: {probe_policy}")
+
 
 def run_with_retry(command: list[str], attempts: int = 3) -> None:
     last_error = None
@@ -352,6 +368,36 @@ def predict_logistic(features: np.ndarray, weights: np.ndarray, mean: np.ndarray
     return x @ weights
 
 
+def zscore_by_calibration(scores: np.ndarray, calibration_indexes: list[int]) -> np.ndarray:
+    calibration_scores = scores[calibration_indexes]
+    return (scores - calibration_scores.mean()) / (calibration_scores.std() + 1e-6)
+
+
+def fit_score_fusion(
+    labels: np.ndarray,
+    original_scores: np.ndarray,
+    cdbd_scores: np.ndarray,
+    calibration_indexes: list[int],
+    alpha_values: list[float],
+) -> tuple[float, np.ndarray, dict]:
+    original_z = zscore_by_calibration(original_scores, calibration_indexes)
+    cdbd_z = zscore_by_calibration(cdbd_scores, calibration_indexes)
+    calibration_labels = labels[calibration_indexes]
+    best_alpha = alpha_values[0]
+    best_metrics = None
+    best_eer = float("inf")
+    for alpha in alpha_values:
+        fused = (alpha * cdbd_z) + ((1.0 - alpha) * original_z)
+        current_metrics = metrics(calibration_labels, fused[calibration_indexes])
+        current_eer = float(current_metrics["eer"])
+        if current_eer < best_eer:
+            best_eer = current_eer
+            best_alpha = alpha
+            best_metrics = current_metrics
+    fused_scores = (best_alpha * cdbd_z) + ((1.0 - best_alpha) * original_z)
+    return best_alpha, fused_scores, best_metrics
+
+
 class MLPBackend(torch.nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -363,6 +409,55 @@ class MLPBackend(torch.nn.Module):
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features).squeeze(1)
+
+
+class ProbeAttentionBackend(torch.nn.Module):
+    def __init__(self, embedding_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.attention = torch.nn.Sequential(
+            torch.nn.Linear(embedding_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear((embedding_dim * 2) + 1, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, original: torch.Tensor, deltas: torch.Tensor, original_score: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.attention(deltas).squeeze(-1), dim=1)
+        pooled_delta = torch.sum(deltas * weights.unsqueeze(-1), dim=1)
+        features = torch.cat([original, pooled_delta, original_score.unsqueeze(1)], dim=1)
+        return self.classifier(features).squeeze(1)
+
+
+class HybridAttentionMLPBackend(torch.nn.Module):
+    def __init__(self, base_dim: int, embedding_dim: int, num_probes: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.attention = torch.nn.Sequential(
+            torch.nn.Linear(embedding_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(base_dim + embedding_dim + num_probes + 3, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, base_features: torch.Tensor, deltas: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.attention(deltas).squeeze(-1), dim=1)
+        pooled_delta = torch.sum(deltas * weights.unsqueeze(-1), dim=1)
+        entropy = -(weights * torch.log(weights + 1e-8)).sum(dim=1, keepdim=True)
+        weight_max = weights.max(dim=1, keepdim=True).values
+        weight_std = weights.std(dim=1, keepdim=True, unbiased=False)
+        features = torch.cat([base_features, pooled_delta, weights, entropy, weight_max, weight_std], dim=1)
         return self.net(features).squeeze(1)
 
 
@@ -416,6 +511,147 @@ def fit_predict_mlp(
     return np.concatenate(scores, axis=0).astype(np.float64)
 
 
+def fit_predict_hybrid_attention_mlp(
+    train_base_features: np.ndarray,
+    train_deltas: np.ndarray,
+    train_labels: np.ndarray,
+    all_base_features: np.ndarray,
+    all_deltas: np.ndarray,
+    seed: int,
+    hidden_dim: int,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    dropout: float,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    targets = (train_labels == 0).astype(np.float32)
+    base_mean = train_base_features.mean(axis=0)
+    base_std = train_base_features.std(axis=0) + 1e-6
+    delta_mean = train_deltas.reshape(-1, train_deltas.shape[-1]).mean(axis=0)
+    delta_std = train_deltas.reshape(-1, train_deltas.shape[-1]).std(axis=0) + 1e-6
+
+    train_base_x = ((train_base_features - base_mean) / base_std).astype(np.float32)
+    train_delta_x = ((train_deltas - delta_mean) / delta_std).astype(np.float32)
+    all_base_x = ((all_base_features - base_mean) / base_std).astype(np.float32)
+    all_delta_x = ((all_deltas - delta_mean) / delta_std).astype(np.float32)
+
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    model = HybridAttentionMLPBackend(
+        train_base_x.shape[1],
+        train_delta_x.shape[-1],
+        train_delta_x.shape[1],
+        hidden_dim,
+        dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    dataset = torch.utils.data.TensorDataset(
+        torch.from_numpy(train_base_x),
+        torch.from_numpy(train_delta_x),
+        torch.from_numpy(targets),
+    )
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+
+    model.train()
+    for _ in range(epochs):
+        for batch_base, batch_delta, batch_y in loader:
+            batch_base = batch_base.to(device)
+            batch_delta = batch_delta.to(device)
+            batch_y = batch_y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(batch_base, batch_delta), batch_y)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    scores = []
+    with torch.no_grad():
+        for start in range(0, all_base_x.shape[0], batch_size):
+            batch_base = torch.from_numpy(all_base_x[start : start + batch_size]).to(device)
+            batch_delta = torch.from_numpy(all_delta_x[start : start + batch_size]).to(device)
+            scores.append(model(batch_base, batch_delta).detach().cpu().numpy())
+    return np.concatenate(scores, axis=0).astype(np.float64)
+
+
+def fit_predict_probe_attention(
+    train_originals: np.ndarray,
+    train_deltas: np.ndarray,
+    train_original_scores: np.ndarray,
+    train_labels: np.ndarray,
+    all_originals: np.ndarray,
+    all_deltas: np.ndarray,
+    all_original_scores: np.ndarray,
+    seed: int,
+    hidden_dim: int,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    dropout: float,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    targets = (train_labels == 0).astype(np.float32)
+    original_mean = train_originals.mean(axis=0)
+    original_std = train_originals.std(axis=0) + 1e-6
+    delta_mean = train_deltas.reshape(-1, train_deltas.shape[-1]).mean(axis=0)
+    delta_std = train_deltas.reshape(-1, train_deltas.shape[-1]).std(axis=0) + 1e-6
+    score_mean = train_original_scores.mean()
+    score_std = train_original_scores.std() + 1e-6
+
+    train_original_x = ((train_originals - original_mean) / original_std).astype(np.float32)
+    train_delta_x = ((train_deltas - delta_mean) / delta_std).astype(np.float32)
+    train_score_x = ((train_original_scores - score_mean) / score_std).astype(np.float32)
+    all_original_x = ((all_originals - original_mean) / original_std).astype(np.float32)
+    all_delta_x = ((all_deltas - delta_mean) / delta_std).astype(np.float32)
+    all_score_x = ((all_original_scores - score_mean) / score_std).astype(np.float32)
+
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    model = ProbeAttentionBackend(train_original_x.shape[1], hidden_dim, dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    dataset = torch.utils.data.TensorDataset(
+        torch.from_numpy(train_original_x),
+        torch.from_numpy(train_delta_x),
+        torch.from_numpy(train_score_x),
+        torch.from_numpy(targets),
+    )
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+
+    model.train()
+    for _ in range(epochs):
+        for batch_original, batch_delta, batch_score, batch_y in loader:
+            batch_original = batch_original.to(device)
+            batch_delta = batch_delta.to(device)
+            batch_score = batch_score.to(device)
+            batch_y = batch_y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(batch_original, batch_delta, batch_score), batch_y)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    scores = []
+    with torch.no_grad():
+        for start in range(0, all_original_x.shape[0], batch_size):
+            batch_original = torch.from_numpy(all_original_x[start : start + batch_size]).to(device)
+            batch_delta = torch.from_numpy(all_delta_x[start : start + batch_size]).to(device)
+            batch_score = torch.from_numpy(all_score_x[start : start + batch_size]).to(device)
+            scores.append(model(batch_original, batch_delta, batch_score).detach().cpu().numpy())
+    return np.concatenate(scores, axis=0).astype(np.float64)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="CDBD-style multi-probe response experiment on top of frozen AASIST.")
     parser.add_argument("--manifest", type=Path, required=True)
@@ -425,6 +661,7 @@ def main() -> None:
     parser.add_argument("--output-features", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--probes", nargs="+", default=DEFAULT_PROBES)
+    parser.add_argument("--probe-policy", choices=["fixed", "codec_adaptive"], default="fixed")
     parser.add_argument("--max-per-codec-class", type=int)
     parser.add_argument("--cal-per-codec-class", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
@@ -435,7 +672,7 @@ def main() -> None:
     parser.add_argument("--logreg-steps", type=int, default=2000)
     parser.add_argument("--logreg-lr", type=float, default=0.05)
     parser.add_argument("--logreg-l2", type=float, default=1e-3)
-    parser.add_argument("--classifier", choices=["logreg", "mlp"], default="logreg")
+    parser.add_argument("--classifier", choices=["logreg", "mlp", "probe_attention", "hybrid_attention_mlp"], default="logreg")
     parser.add_argument("--mlp-hidden", type=int, default=128)
     parser.add_argument("--mlp-epochs", type=int, default=100)
     parser.add_argument("--mlp-lr", type=float, default=1e-3)
@@ -447,6 +684,10 @@ def main() -> None:
 
     if "original" not in args.probes:
         args.probes = ["original", *args.probes]
+    if args.probe_policy == "codec_adaptive" and args.feature_level != "embedding":
+        raise ValueError("--probe-policy codec_adaptive currently requires --feature-level embedding")
+    if args.probe_policy == "codec_adaptive" and args.classifier in {"probe_attention", "hybrid_attention_mlp"}:
+        raise ValueError("--probe-policy codec_adaptive currently supports logreg/mlp classifiers only")
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     model, cut = load_model(args.config, args.weights, device)
@@ -457,25 +698,36 @@ def main() -> None:
     probe_score_rows = []
     feature_rows = []
     features = []
+    attention_originals = []
+    attention_deltas = []
+    attention_original_scores = []
     labels = []
     codecs = []
     utterance_ids = []
+    selected_probe_counts: dict[str, int] = defaultdict(int)
 
     for index, row in enumerate(rows, start=1):
         audio, sample_rate = load_audio_with_retry(row["path"])
-        views = [apply_probe(audio, sample_rate, probe, row["utterance_id"]) for probe in args.probes]
+        row_probes = probes_for_codec(row["codec"], args.probes, args.probe_policy)
+        selected_probe_counts[" ".join(row_probes)] += 1
+        views = [apply_probe(audio, sample_rate, probe, row["utterance_id"]) for probe in row_probes]
         scores, embeddings = encode_views(model, device, cut, views, args.batch_size)
-        score_map = dict(zip(args.probes, scores))
-        embedding_map = dict(zip(args.probes, embeddings))
+        score_map = dict(zip(row_probes, scores))
+        embedding_map = dict(zip(row_probes, embeddings))
         if names is None:
-            names = feature_names(args.probes, embeddings.shape[1], args.feature_level)
+            names = feature_names(row_probes, embeddings.shape[1], args.feature_level)
             if args.use_codec_onehot:
                 names = [*names, *codec_feature_names(codec_names)]
-        row_features = response_features(score_map, embedding_map, args.probes, args.feature_level)
+        row_features = response_features(score_map, embedding_map, row_probes, args.feature_level)
         if args.use_codec_onehot:
             row_features = [*row_features, *codec_onehot(row["codec"], codec_names)]
+        original_embedding = embedding_map["original"].astype(np.float64)
+        probe_embeddings = np.stack([embedding_map[name] for name in row_probes if name != "original"]).astype(np.float64)
+        attention_originals.append(original_embedding)
+        attention_deltas.append(probe_embeddings - original_embedding)
+        attention_original_scores.append(float(score_map["original"]))
 
-        for probe in args.probes:
+        for probe in row_probes:
             probe_score_rows.append([row["utterance_id"], row["codec"], row["label"], probe, score_map[probe]])
         feature_rows.append([row["utterance_id"], row["codec"], row["label"], *row_features])
         features.append(row_features)
@@ -487,6 +739,14 @@ def main() -> None:
             print(f"processed {index}/{len(rows)}", flush=True)
 
     feature_array = np.asarray(features, dtype=np.float64)
+    if args.classifier in {"probe_attention", "hybrid_attention_mlp"}:
+        attention_original_array = np.asarray(attention_originals, dtype=np.float64)
+        attention_delta_array = np.asarray(attention_deltas, dtype=np.float64)
+        attention_original_score_array = np.asarray(attention_original_scores, dtype=np.float64)
+    else:
+        attention_original_array = None
+        attention_delta_array = None
+        attention_original_score_array = None
     label_array = np.asarray(labels, dtype=np.int64)
     if names is None:
         raise ValueError("no rows were processed")
@@ -502,11 +762,45 @@ def main() -> None:
             l2=args.logreg_l2,
         )
         cdbd_scores = predict_logistic(feature_array, weights, mean, std)
-    else:
+    elif args.classifier == "mlp":
         cdbd_scores = fit_predict_mlp(
             feature_array[cal_indexes],
             label_array[cal_indexes],
             feature_array,
+            seed=args.seed,
+            hidden_dim=args.mlp_hidden,
+            epochs=args.mlp_epochs,
+            lr=args.mlp_lr,
+            weight_decay=args.mlp_weight_decay,
+            dropout=args.mlp_dropout,
+            batch_size=args.mlp_batch_size,
+            device=device,
+        )
+    elif args.classifier == "probe_attention":
+        cdbd_scores = fit_predict_probe_attention(
+            attention_original_array[cal_indexes],
+            attention_delta_array[cal_indexes],
+            attention_original_score_array[cal_indexes],
+            label_array[cal_indexes],
+            attention_original_array,
+            attention_delta_array,
+            attention_original_score_array,
+            seed=args.seed,
+            hidden_dim=args.mlp_hidden,
+            epochs=args.mlp_epochs,
+            lr=args.mlp_lr,
+            weight_decay=args.mlp_weight_decay,
+            dropout=args.mlp_dropout,
+            batch_size=args.mlp_batch_size,
+            device=device,
+        )
+    else:
+        cdbd_scores = fit_predict_hybrid_attention_mlp(
+            feature_array[cal_indexes],
+            attention_delta_array[cal_indexes],
+            label_array[cal_indexes],
+            feature_array,
+            attention_delta_array,
             seed=args.seed,
             hidden_dim=args.mlp_hidden,
             epochs=args.mlp_epochs,
@@ -521,6 +815,15 @@ def main() -> None:
     test_original = original_scores[test_indexes]
     test_cdbd = cdbd_scores[test_indexes]
     test_codecs = [codecs[index] for index in test_indexes]
+    fusion_alpha_values = [round(index / 20.0, 2) for index in range(21)]
+    fusion_alpha, fusion_scores, fusion_calibration_metrics = fit_score_fusion(
+        label_array,
+        original_scores,
+        cdbd_scores,
+        cal_indexes,
+        fusion_alpha_values,
+    )
+    test_fusion = fusion_scores[test_indexes]
     result = {
         "manifest": str(args.manifest),
         "n_total": len(rows),
@@ -528,6 +831,9 @@ def main() -> None:
         "n_test": len(test_indexes),
         "seed": args.seed,
         "probes": args.probes,
+        "probe_policy": args.probe_policy,
+        "codec_adaptive_probes": CODEC_ADAPTIVE_PROBES if args.probe_policy == "codec_adaptive" else {},
+        "selected_probe_counts": dict(sorted(selected_probe_counts.items())),
         "feature_level": args.feature_level,
         "classifier": args.classifier,
         "use_codec_onehot": args.use_codec_onehot,
@@ -540,6 +846,14 @@ def main() -> None:
         f"cdbd_probe_{args.classifier}": {
             "overall": metrics(test_labels, test_cdbd),
             "by_codec": metrics_by_codec(test_labels, test_cdbd, test_codecs),
+        },
+        "score_fusion": {
+            "formula": "alpha * zscore(cdbd_score) + (1 - alpha) * zscore(original_score)",
+            "alpha_grid": fusion_alpha_values,
+            "selected_alpha": fusion_alpha,
+            "calibration": fusion_calibration_metrics,
+            "overall": metrics(test_labels, test_fusion),
+            "by_codec": metrics_by_codec(test_labels, test_fusion, test_codecs),
         },
     }
 

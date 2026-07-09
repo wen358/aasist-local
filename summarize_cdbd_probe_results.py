@@ -30,11 +30,11 @@ def pstdev(values: list[float]) -> float:
     return statistics.pstdev(values) if values else float("nan")
 
 
-def summarize_group(group: str, paths: list[Path]) -> dict:
+def summarize_group(group: str, paths: list[Path], section_mode: str) -> dict:
     rows = []
     for path in paths:
         result = json.loads(path.read_text(encoding="utf-8"))
-        section = cdbd_section(result)
+        section = "score_fusion" if section_mode == "score_fusion" else cdbd_section(result)
         baseline_eer = metric(result, "baseline_original_score", "eer_percent")
         cdbd_eer = metric(result, section, "eer_percent")
         baseline_acc = metric(result, "baseline_original_score", "accuracy_at_0")
@@ -69,6 +69,7 @@ def summarize_group(group: str, paths: list[Path]) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Summarize CDBD probe experiment JSON results.")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--section", choices=["cdbd", "score_fusion"], default="cdbd")
     parser.add_argument("groups", nargs="+", help="Format: group_name=glob_pattern")
     args = parser.parse_args()
 
@@ -81,7 +82,7 @@ def main() -> None:
         if not paths:
             print(f"warning: no files matched {group}: {pattern}")
             continue
-        summaries.append(summarize_group(group, paths))
+        summaries.append(summarize_group(group, paths, args.section))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
